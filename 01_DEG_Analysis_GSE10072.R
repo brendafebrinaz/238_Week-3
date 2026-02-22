@@ -1,0 +1,558 @@
+# ============================================================
+# ANALISIS EKSPRESI GEN MICROARRAY + ENRICHMENT
+# Dataset  : GSE10072
+# Platform : Affymetrix GPL96
+# Tujuan   : DEG + GO + KEGG (ALL, UP, DOWN)
+# ============================================================
+
+#Modul: Analisis Ekspresi Gen Kanker Paru 
+#Dataset: GSE10072 (Lung Adenocarcinoma vs Normal)
+#Platform: Microarray (Affymetrix GPL96)
+#Tujuan: Mengidentifikasi Differentially Expressed Genes (DEG) 
+
+#PART A. PENGANTAR KONSEP 
+
+#Analisis ekspresi gen bertujuan untuk membandingkan tingkat ekspresi gen 
+#antara dua kondisi biologis (misalnya kanker vs normal) 
+#Pada modul ini kita menggunakan pendekatan statistik limma (Linear Models
+#for Microarray Data), yang merupakan standar emas untuk data microarray. 
+
+#PART B. PERSIAPAN LINGKUNGAN KERJA (INSTALL & LOAD PACKAGE) 
+
+#Apa itu package? 
+#Package adalah kumpulan fungsi siap pakai di R
+#Bioinformatika di R sangat bergantung pada package dari CRAN dan Bioconductor 
+
+# ================================
+# PART A. INSTALL & LOAD PACKAGE
+# ================================
+
+#1. Install BiocManager (manajer paket Bioconductor) 
+#IF adalah struktur logika : “jika kondisi terpenuhi, lakukan aksi”
+
+if (!require("BiocManager", quietly = TRUE))  {
+  install.packages("BiocManager") 
+}
+
+
+BiocManager::install(
+  c("GEOquery",
+    "limma",
+    "hgu133a.db",
+    "clusterProfiler",
+    "org.Hs.eg.db",
+    "enrichplot"),
+  update = FALSE,
+  ask = FALSE
+)
+
+
+# 2. Install paket Bioconductor (GEOquery & limma) 
+#GEOquery: mengambil data dari database GEO 
+#limma: analisis statistik ekspresi gen 
+
+BiocManager::install(c("GEOquery", "limma"), ask = FALSE, update = FALSE) 
+
+#Install annotation package sesuai platform
+#GPL96 = Affymetrix Human Genome U133A 
+BiocManager::install("hgu133a.db", ask = FALSE, update = FALSE)
+
+BiocManager::install(
+  c("GEOquery", "limma", "hgu133a.db",
+    "clusterProfiler", "org.Hs.eg.db", "enrichplot"),
+  ask = FALSE, update = FALSE
+)
+
+#3. Install paket CRAN untuk visualisasi dan manipulasi data 
+#phetmap: heatmap ekspresi gen 
+#ggplot2: grafik (volcano plot)
+#dplyr: manipulasi tabel data 
+
+install.packages(c("pheatmap", "ggplot2", "dplyr"))
+
+#umap: grafik (plot UMAP) 
+if (!requireNamespace("umap", quietly = TRUE)) {
+  install.packages("umap")
+}
+
+#4. Memanggil library 
+#library() digunakan agar fungsi di dalam package bisa digunakan 
+library(GEOquery)
+library(limma)
+library(pheatmap)
+library(ggplot2)
+library(dplyr)
+library(hgu133a.db)
+library(AnnotationDbi)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(enrichplot)
+library(umap)
+
+
+#PART C. PENGAMBILAN DATA DARI GEO 
+
+
+#GEO (Gene Expression Omnibus) adalah database publik milik NCBI
+#getGEO(): fungsi untuk mengunduh dataset berdasarkan ID GEO
+#GSEMatrix = TRUE -> data diambil dalam format ExpressionSet
+#AnnotGPL  = TRUE -> anotasi gen (Gene Symbol) ikut diunduh
+
+gset <- getGEO("GSE10072", GSEMatrix = TRUE, AnnotGPL = TRUE)[[1]]
+
+#ExpressionSet berisi:
+# - exprs() : matriks ekspresi gen
+# - pData() : metadata sampel
+# - fData() : metadata fitur (probe / gen)
+
+
+#PART D. PRE-PROCESSING DATA EKSPRESI 
+
+# exprs(): mengambil matriks ekspresi gen
+# Baris  = probe/gen
+# Kolom  = sampel
+ex <- exprs(gset)
+
+#Mengapa perlu log2 transformasi?
+#Data microarray mentah memiliki rentang nilai sangat besar.
+#Log2 digunakan untuk:
+#1. Menstabilkan varians
+#2. Mendekati asumsi model linear
+#3. Memudahkan interpretasi log fold change
+
+#quantile(): menghitung nilai kuantil (persentil)
+#as.numeric(): mengubah hasil quantile (yang berupa named vector)
+#menjadi vektor numerik biasa agar mudah dibandingkan
+qx <- as.numeric(quantile(ex, c(0, 0.25, 0.5, 0.75, 0.99, 1), na.rm = TRUE))
+
+#LogTransform adalah variabel logika (TRUE / FALSE)
+#Operator logika:
+#>  : lebih besar dari
+#| | : OR (atau)
+#&& : AND (dan)
+LogTransform <- (qx[5] > 100) || (qx[6] - qx[1] > 50 && qx[2] > 0)
+
+#IF statement:
+#Jika LogTransform = TRUE, maka lakukan log2
+if (LogTransform) {
+  # Nilai <= 0 tidak boleh di-log, maka diubah menjadi NA
+  ex[ex <= 0] <- NA
+  ex <- log2(ex)
+}
+
+
+#PART E. DEFINISI KELOMPOK SAMPEL 
+
+#pData(): metadata sampel
+#source_name_ch1 berisi informasi kondisi biologis sampel
+group_info <- pData(gset)[["source_name_ch1"]]
+
+#make.names(): mengubah teks menjadi format valid untuk R
+groups <- make.names(group_info)
+
+#factor():
+#Mengubah data kategorik menjadi faktor
+#Faktor sangat penting untuk analisis statistik di R
+gset$group <- factor(groups)
+
+#levels(): melihat kategori unik dalam faktor
+nama_grup <- levels(gset$group)
+print(nama_grup)
+
+#PART F. DESIGN MATRIX (KERANGKA STATISTIK) 
+
+#model.matrix():
+#Membuat matriks desain untuk model linear
+#~0 berarti TANPA intercept (best practice limma)
+design <- model.matrix(~0 + gset$group)
+
+#colnames(): memberi nama kolom agar mudah dibaca
+colnames(design) <- levels(gset$group)
+
+#Menentukan perbandingan biologis
+grup_kanker <- nama_grup[1]
+grup_normal <- nama_grup[2]
+
+contrast_formula <- paste(grup_kanker, "-", grup_normal)
+print(paste("Kontras yang dianalisis:", contrast_formula))
+
+
+#PART G. ANALISIS DIFFERENTIAL EXPRESSION (LIMMA)
+
+#lmFit():
+#Membangun model linear untuk setiap gen
+fit <- lmFit(ex, design)
+
+#makeContrasts(): mendefinisikan perbandingan antar grup
+contrast_matrix <- makeContrasts(contrasts = contrast_formula, levels = design)
+
+#contrasts.fit(): menerapkan kontras ke model
+fit2 <- contrasts.fit(fit, contrast_matrix)
+
+#eBayes():
+#Empirical Bayes untuk menstabilkan estimasi varians
+fit2 <- eBayes(fit2)
+
+#topTable():
+#Mengambil hasil akhir DEG
+#adjust = "fdr" -> koreksi multiple testing
+#p.value = 0.01  -> gen sangat signifikan
+topTableResults <- topTable(
+  fit2,
+  adjust = "fdr",
+  sort.by = "B",
+  number = Inf,
+  p.value = 0.01
+)
+
+head(topTableResults)
+
+
+#PART H. ANOTASI NAMA GEN 
+
+#Penting:
+#Pada data microarray Affymetrix, unit analisis awal adalah PROBE,
+#bukan gen. Oleh karena itu, anotasi ulang diperlukan menggunakan
+#database resmi Bioconductor.
+
+#Mengambil ID probe dari hasil DEG
+probe_ids <- rownames(topTableResults)
+
+#Mapping probe -> gene symbol & gene name
+gene_annotation <- AnnotationDbi::select(
+  hgu133a.db,
+  keys = probe_ids,
+  columns = c("SYMBOL", "GENENAME"),
+  keytype = "PROBEID"
+)
+
+#Gabungkan dengan hasil limma
+topTableResults$PROBEID <- rownames(topTableResults)
+
+topTableResults <- merge(
+  topTableResults,
+  gene_annotation,
+  by = "PROBEID",
+  all.x = TRUE
+)
+
+#Cek hasil anotasi
+head(topTableResults[, c("PROBEID", "SYMBOL", "GENENAME")])
+
+
+
+# ================================
+# SET OUTPUT FOLDER
+# ================================
+
+if (!dir.exists("Hasil_Plot")) {
+  dir.create("Hasil_Plot")
+}
+
+
+# Cek working directory
+getwd()
+
+# Buka device PNG
+png(filename = "Hasil_Plot/01_Boxplot_GSE10072.png",
+    width = 2000,
+    height = 1200,
+    res = 300)
+
+
+#PART I.1 BOXPLOT DISTRIBUSI NILAI EKSPRESI 
+
+#Boxplot digunakan untuk:
+#- Mengecek distribusi nilai ekspresi antar sampel
+#- Melihat apakah ada batch effect
+#- Mengevaluasi apakah normalisasi/log-transform sudah wajar
+
+#Set warna berdasarkan grup
+group_colors <- as.numeric(gset$group)
+
+boxplot(
+  ex,
+  col = group_colors,
+  las = 2,
+  outline = FALSE,
+  main = "Boxplot Distribusi Nilai Ekspresi per Sampel",
+  ylab = "Expression Value (log2)"
+)
+
+legend(
+  "topright",
+  legend = levels(gset$group),
+  fill = unique(group_colors),
+  cex = 0.8
+)
+
+# Tutup device
+dev.off()
+
+# Cek apakah file benar-benar ada
+file.info("Hasil_Plot/01_Boxplot_GSE10072.png")
+
+
+#PART I.2 DISTRIBUSI NILAI EKSPRESI (DENSITY PLOT) 
+
+expr_long <- data.frame(
+  Expression = as.vector(ex),
+  Group = rep(gset$group, each = nrow(ex))
+)
+
+
+#Density plot menunjukkan sebaran global nilai ekspresi gen
+#Digunakan untuk:
+#- Mengecek efek log-transform
+#- Membandingkan distribusi antar grup
+
+#Gabungkan ekspresi & grup ke data frame
+expr_long <- data.frame(
+  Expression = as.vector(ex),
+  Group = rep(gset$group, each = nrow(ex))
+)
+
+# Buat plot dulu (disimpan dalam objek)
+p_density <- ggplot(expr_long, aes(x = Expression, color = Group)) +
+  geom_density(linewidth = 1) +
+  theme_minimal() +
+  labs(
+    title = "Distribusi Nilai Ekspresi Gen",
+    x = "Expression Value (log2)",
+    y = "Density"
+  )
+
+# Tampilkan di viewer (opsional tapi enak buat cek)
+print(p_density)
+
+# Simpan otomatis resolusi tinggi
+ggsave(
+  filename = "Hasil_Plot/02_DensityPlot_GSE10072.png",
+  plot = p_density,
+  width = 10,
+  height = 6,
+  dpi = 300
+)
+
+file.info("Hasil_Plot/02_DensityPlot_GSE10072.png")
+
+#PART I.3 UMAP (VISUALISASI DIMENSI RENDAH)
+
+#UMAP digunakan untuk:
+#- Mereduksi ribuan gen menjadi 2 dimensi
+#- Melihat pemisahan sampel secara global
+#- Alternatif PCA (lebih sensitif ke struktur lokal)
+
+#Transpose matriks ekspresi:
+#UMAP bekerja pada OBSERVATION = sampel
+umap_input <- t(ex)
+
+#Jalankan UMAP
+umap_result <- umap(umap_input)
+
+#Simpan hasil ke data frame
+umap_df <- data.frame(
+  UMAP1 = umap_result$layout[, 1],
+  UMAP2 = umap_result$layout[, 2],
+  Group = gset$group
+)
+
+#Plot UMAP
+ggsave(
+  filename = "Hasil_Plot/03_UMAP_GSE10072.png",
+  plot = ggplot(umap_df, aes(x = UMAP1, y = UMAP2, color = Group)) +
+  geom_point(size = 3, alpha = 0.8) +
+  theme_minimal() +
+  labs(
+    title = "UMAP Plot Sampel Berdasarkan Ekspresi Gen",
+    x = "UMAP 1",
+    y = "UMAP 2"
+  ),
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+
+#PART J.1 VISUALISASI VOLCANO PLOT 
+
+#Volcano plot menggabungkan:
+#- Log fold change (efek biologis)
+#- Signifikansi statistik
+
+volcano_data <- data.frame(
+  logFC = topTableResults$logFC,
+  adj.P.Val = topTableResults$adj.P.Val,
+  Gene = topTableResults$SYMBOL
+)
+
+#Klasifikasi status gen
+volcano_data$status <- "NO"
+volcano_data$status[volcano_data$logFC > 1 & volcano_data$adj.P.Val < 0.01] <- "UP"
+volcano_data$status[volcano_data$logFC < -1 & volcano_data$adj.P.Val < 0.01] <- "DOWN"
+
+#Visualisasi
+p_volcano <- ggplot(volcano_data, aes(x = logFC, y = -log10(adj.P.Val), color = status)) +
+  geom_point(alpha = 0.6) +
+  scale_color_manual(values = c("DOWN" = "blue", "NO" = "grey", "UP" = "red")) +
+  geom_vline(xintercept = c(-1, 1), linetype = "dashed") +
+  geom_hline(yintercept = -log10(0.01), linetype = "dashed") +
+  theme_minimal() +
+  ggtitle("Volcano Plot DEG Kanker Paru")
+  
+#Tampilkan di viewer
+print(p_volcano)
+
+#Simpan otomatis
+ggsave(
+  filename = "Hasil_Plot/04_Volcano_GSE10072.png",
+  plot = p_volcano,
+  width = 8,
+  height = 6,
+  dpi = 300
+)
+
+#PART J.2 VISUALISASI HEATMAP 
+
+#Heatmap digunakan untuk melihat pola ekspresi gen
+#antar sampel berdasarkan gen-gen paling signifikan
+
+#Pilih 50 gen paling signifikan berdasarkan adj.P.Val
+topTableResults <- topTableResults[
+  order(topTableResults$adj.P.Val),
+]
+
+top50 <- head(topTableResults, 50)
+
+#Ambil matriks ekspresi untuk gen terpilih
+mat_heatmap <- ex[top50$PROBEID, ]
+
+#Gunakan Gene Symbol (fallback ke Probe ID)
+gene_label <- ifelse(
+  is.na(top50$SYMBOL) | top50$SYMBOL == "",
+  top50$PROBEID,      # jika SYMBOL kosong → probe ID
+  top50$SYMBOL        # jika ada → gene symbol
+)
+
+rownames(mat_heatmap) <- gene_label
+
+#Pembersihan data (WAJIB agar tidak error hclust)
+#Hapus baris dengan NA
+mat_heatmap <- mat_heatmap[
+  rowSums(is.na(mat_heatmap)) == 0,
+]
+
+#Hapus gen dengan varians nol
+gene_variance <- apply(mat_heatmap, 1, var)
+mat_heatmap <- mat_heatmap[gene_variance > 0, ]
+
+#Anotasi kolom (kelompok sampel)
+annotation_col <- data.frame(
+  Group = gset$group
+)
+
+rownames(annotation_col) <- colnames(mat_heatmap)
+
+#Tentukan nama file output
+heatmap_file <- "Hasil_Plot/05_Heatmap_Top50_GSE10072.png"
+
+#Hitung tinggi otomatis: sekitar 0.25 inch per gen agar label tidak saling tumpang tindih
+heatmap_height <- max(6, nrow(mat_heatmap) * 0.25)
+
+#Visualisasi heatmap 
+pheatmap(
+  mat_heatmap,
+  scale = "row",                 # Z-score per gen
+  annotation_col = annotation_col,
+  show_colnames = FALSE,         # nama sampel dimatikan
+  show_rownames = TRUE,
+  fontsize_row = 7,
+  clustering_distance_rows = "euclidean",
+  clustering_distance_cols = "euclidean",
+  clustering_method = "complete",
+  main = "Top 50 Differentially Expressed Genes",
+  filename = heatmap_file,       # Simpan otomatis
+  width = 8,                     # lebar dalam inch
+  height = heatmap_height,       # tinggi menyesuaikan jumlah gen
+  dpi = 300
+)
+
+
+# ================================
+# K. ENRICHMENT ALL GENES
+# ================================
+
+deg_all <- topTableResults %>%
+  filter(!is.na(SYMBOL)) %>%
+  pull(SYMBOL) %>%
+  unique()
+
+entrez_all <- bitr(deg_all,
+                   fromType = "SYMBOL",
+                   toType = "ENTREZID",
+                   OrgDb = org.Hs.eg.db)
+
+# GO enrichment
+ego_all <- enrichGO(
+  gene = entrez_all$ENTREZID,
+  OrgDb = org.Hs.eg.db,
+  ont = "BP",
+  pvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+p1 <- dotplot(ego_all, showCategory = 15) + ggtitle("GO BP - ALL DEG")
+ggsave("Hasil_Plot/GO_BP_All_DEG.png", plot = p1, width = 8, height = 6, dpi = 300)
+
+# KEGG enrichment
+ekegg_all <- enrichKEGG(
+  gene = entrez_all$ENTREZID,
+  organism = "hsa",
+  pvalueCutoff = 0.05
+)
+ekegg_all <- setReadable(ekegg_all, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+
+p2 <- dotplot(ekegg_all, showCategory = 15) + ggtitle("KEGG - ALL DEG")
+ggsave("Hasil_Plot/KEGG_All_DEG.png", plot = p2, width = 8, height = 6, dpi = 300)
+
+
+# ================================
+# L. ENRICHMENT UP vs DOWN
+# ================================
+
+deg_up <- topTableResults %>% filter(logFC > 1 & !is.na(SYMBOL)) %>% pull(SYMBOL) %>% unique()
+deg_down <- topTableResults %>% filter(logFC < -1 & !is.na(SYMBOL)) %>% pull(SYMBOL) %>% unique()
+
+entrez_up <- bitr(deg_up, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+entrez_down <- bitr(deg_down, fromType = "SYMBOL", toType = "ENTREZID", OrgDb = org.Hs.eg.db)
+
+# GO UP
+ego_up <- enrichGO(entrez_up$ENTREZID, OrgDb = org.Hs.eg.db, ont = "BP", pvalueCutoff = 0.05, readable = TRUE)
+p3 <- dotplot(ego_up, showCategory = 15) + ggtitle("GO BP - UP Genes")
+ggsave("Hasil_Plot/GO_BP_UP_DEG.png", plot = p3, width = 8, height = 6, dpi = 300)
+
+# GO DOWN
+ego_down <- enrichGO(entrez_down$ENTREZID, OrgDb = org.Hs.eg.db, ont = "BP", pvalueCutoff = 0.05, readable = TRUE)
+p4 <- dotplot(ego_down, showCategory = 15) + ggtitle("GO BP - DOWN Genes")
+ggsave("Hasil_Plot/GO_BP_DOWN_DEG.png", plot = p4, width = 8, height = 6, dpi = 300)
+
+# KEGG UP
+ekegg_up <- enrichKEGG(entrez_up$ENTREZID, organism = "hsa", pvalueCutoff = 0.05)
+ekegg_up <- setReadable(ekegg_up, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+p5 <- dotplot(ekegg_up, showCategory = 15) + ggtitle("KEGG - UP Genes")
+ggsave("Hasil_Plot/KEGG_UP_DEG.png", plot = p5, width = 8, height = 6, dpi = 300)
+
+# KEGG DOWN
+ekegg_down <- enrichKEGG(entrez_down$ENTREZID, organism = "hsa", pvalueCutoff = 0.05)
+ekegg_down <- setReadable(ekegg_down, OrgDb = org.Hs.eg.db, keyType="ENTREZID")
+p6 <- dotplot(ekegg_down, showCategory = 15) + ggtitle("KEGG - DOWN Genes")
+ggsave("Hasil_Plot/KEGG_DOWN_DEG.png", plot = p6, width = 8, height = 6, dpi = 300)
+
+
+#M. MENYIMPAN HASIL 
+
+# write.csv(): menyimpan hasil analisis ke file CSV
+write.csv(topTableResults, "Hasil_GSE10072_DEG.csv")
+
+message("Analisis selesai. File hasil telah disimpan.")
+
